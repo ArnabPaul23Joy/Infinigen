@@ -1299,22 +1299,43 @@ class OptLM:
 
 
 def get_filename(args):
+    # Builds a unique filename that mirrors the CLI args passed by run.sh (Section 2),
+    # so each scheme ("original", "int4", "h2o", "infinigen") produces a distinct file.
+
+    # e.g. args.model = "huggingface/opt-13b"  →  model_size = "13b"
     model_size = args.model.split('-')[-1]
+
+    # run.sh passes --percent 100 0 0 100 100 0, meaning:
+    #   weights 100% GPU / 0% CPU / 0% disk
+    #   KV cache 0% GPU / 100% CPU / 0% disk
+    #   activations 100% GPU / 0% CPU / 0% disk
+    # This loop serializes that list into "100-0-0-100-100-0-" for the filename.
     percent = ""
     for i in range(len(args.percent)):
         percent += str(args.percent[i]) + "-"
+
+    # Core stem: "fo-13b-gbs20-ngbs1-prompt1920-gen128-percent-100-0-0-100-100-0-"
+    # (gbs / ngbs come from --gpu-batch-size 20 --num-gpu-batches 1 in run.sh)
     filename = f"fo-{model_size}-gbs{args.gpu_batch_size}-" \
                f"ngbs{args.num_gpu_batches}-" \
                f"prompt{args.prompt_len}-" \
                f"gen{args.gen_len}-percent-{percent}"
+
+    # Appends where KV-cache attention scores are computed (CPU vs GPU).
     if args.cpu_cache_compute:
         filename += "cpu-cache"
     else:
         filename += "gpu-cache"
+
+    # "-compw": weight compression enabled (not used in run.sh's four schemes).
     if args.compress_weight:
         filename += "-compw"
+
+    # "-compc": KV-cache INT4 compression — set by --compress-cache in the "int4"
+    # scheme branch of run.sh, distinguishing it from the "original" baseline.
     if args.compress_cache:
         filename += "-compc"
+
     return filename
 
 
@@ -1328,22 +1349,40 @@ def get_inputs(prompt_len, num_prompts, tokenizer, path):
     return (input_ids[0],) * num_prompts
 
 def run_flexgen(args):
+    # ── Tokenizer ────────────────────────────────────────────────────────────
+    # Galactica uses its own tokenizer; all OPT variants share opt-30b's tokenizer.
+    # padding_side="left" ensures shorter prompts are padded on the left so the
+    # final real token is always at the rightmost position for autoregressive decoding.
     if args.model == "facebook/galactica-30b":
         tokenizer = AutoTokenizer.from_pretrained("facebook/galactica-30b", padding_side="left")
     else:
         tokenizer = AutoTokenizer.from_pretrained("facebook/opt-30b", padding_side="left")
+
+    # Total prompts processed in parallel = num_gpu_batches × gpu_batch_size.
+    # run.sh uses --num-gpu-batches 1 --gpu-batch-size 20, so num_prompts = 20.
     num_prompts = args.num_gpu_batches * args.gpu_batch_size
     prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
 
-    # Task and policy
+    # ── Inputs ───────────────────────────────────────────────────────────────
+    # Warmup uses a fixed length of 2048 to prime GPU caches before benchmarking.
+    # Actual benchmark inputs use prompt_len from args (1920 in run.sh).
     warmup_inputs = get_inputs(2048, num_prompts, tokenizer, args.warmup_input_path)
     inputs = get_inputs(prompt_len, num_prompts, tokenizer, args.test_input_path)
 
+    # ── Execution environment ─────────────────────────────────────────────────
+    # Three storage tiers: GPU VRAM, CPU DRAM, and disk (for tensor offloading).
+    # TorchMixedDevice allows tensors to be split across all three simultaneously.
     gpu = TorchDevice("cuda:0")
     cpu = TorchDevice("cpu")
     disk = TorchDisk(args.offload_dir)
     env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
 
+    # ── Offloading policy ─────────────────────────────────────────────────────
+    # percent[0..1]: GPU/CPU % for weights   (run.sh: 100 0  → weights on GPU)
+    # percent[2..3]: GPU/CPU % for KV cache  (run.sh:  0 100 → KV cache on CPU)
+    # percent[4..5]: GPU/CPU % for activations (run.sh: 100 0 → activations on GPU)
+    # compress_weight uses 4-bit group quantization along dim 0 (output channels).
+    # compress_cache uses 4-bit group quantization along dim 2 (sequence dimension).
     policy = Policy(args.gpu_batch_size, args.num_gpu_batches,
                     args.percent[0], args.percent[1],
                     args.percent[2], args.percent[3],
@@ -1356,29 +1395,44 @@ def run_flexgen(args):
                     args.compress_cache,
                     CompressionConfig(num_bits=4, group_size=64,
                                       group_dim=2, symmetric=False))
+    # KV-cache compression and attention sparsity (H2O-style eviction) cannot
+    # be combined — the sparse attention path assumes full-precision cache entries.
     assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
 
+    # ── Model construction ────────────────────────────────────────────────────
+    # Fetch the OPT architecture config (layers, heads, hidden dim) for the chosen model.
+    # cache_size / hidden_size are computed for memory budget logging (not used further here).
+    # InfiniGen-specific args: partial_weight_ratio, alpha, max_num_kv control
+    # speculative KV fetching (see SelfAttention.prefetch_cache).
     opt_config = get_opt_config(args.model)
     cache_size = opt_config.cache_bytes(num_prompts, prompt_len + gen_len)
     hidden_size = opt_config.hidden_bytes(num_prompts, prompt_len + gen_len)
     model = OptLM(opt_config, env, args.path, policy, args.partial_weight_ratio, args.alpha, args.max_num_kv)
 
+    # ── Generation ────────────────────────────────────────────────────────────
     try:
+        # Warmup pass (1 token): loads weights into their offload homes and warms
+        # up CUDA kernels so the benchmark measurement is not polluted by cold starts.
         output_ids = model.generate(
             warmup_inputs, max_new_tokens=1, verbose=args.verbose, warmup=True)
 
+        # Reset timers after warmup, then run the real benchmark.
+        # costs[0] = prefill latency; costs[1:] = per-step decode latencies.
         timers("generate").reset()
         output_ids = model.generate(
             inputs, max_new_tokens=args.gen_len,
             debug_mode=args.debug_mode, cut_gen_len=cut_gen_len, verbose=args.verbose)
         costs = timers("generate").costs
     finally:
+        # Always shut down background CPU↔GPU copy threads even if generation fails.
         env.close_copy_threads()
 
-    # Log output
+    # ── Latency & throughput accounting ──────────────────────────────────────
     prefill_latency = costs[0]
     prefill_throughput = num_prompts * prompt_len / prefill_latency
     if cut_gen_len:  # project latency of cut_gen_len to gen_len
+        # If only a partial decode was run (for fast debugging), extrapolate
+        # to the full gen_len so numbers are comparable across runs.
         decode_latency = project_decode_latency(costs, prompt_len, gen_len)
     else:
         decode_latency = sum(costs[1:])
@@ -1389,8 +1443,10 @@ def run_flexgen(args):
     _, gpu_peak_mem = gpu.mem_stats()
     _, cpu_peak_mem = cpu.mem_stats()
 
+    # projected=True flags that reported numbers are estimates, not direct measurements.
     projected = bool(args.debug_mode or cut_gen_len)
 
+    # ── Results ───────────────────────────────────────────────────────────────
     print("+++++++++++++++++++++++++++++++++++++++++++++++++")
     print("InfiniGen (Ours)")
     print("input: " + str(prompt_len) + " output: " + str(gen_len) + " bsz: " + str(num_prompts))
@@ -1450,10 +1506,18 @@ def add_parser_arguments(parser):
     parser.add_argument("--test-input-path", type=str)
 
 if __name__ == "__main__":
+    # Entry point invoked by run.sh via: python -m flexgen.flex_opt <flags>
     parser = argparse.ArgumentParser()
+
+    # Register all CLI flags (--model, --percent, --gpu-batch-size, etc.)
     add_parser_arguments(parser)
+
+    # Capture the flag values passed by run.sh into the args namespace
     args = parser.parse_args()
 
+    # --percent must have exactly 6 values: GPU/CPU/disk % for each of
+    # weights, KV cache, and activations (e.g. "100 0 0 100 100 0" in run.sh)
     assert len(args.percent) == 6
 
+    # Hand off to the main execution loop (model load, prefill, decode)
     run_flexgen(args)

@@ -10,7 +10,7 @@ import pickle
 import time
 from typing import Union, List, Optional
 
-import numpy as np
+import numpy as npf
 from tqdm import tqdm
 import torch
 from transformers import AutoTokenizer
@@ -32,37 +32,48 @@ DUMMY_WEIGHT = "_DUMMY_"  # Use dummy weights for benchmark purposes
 
 @dataclasses.dataclass(frozen=True)
 class Policy:
+    # Number of sequences processed together in one GPU forward pass.
+    # Total sequences = gpu_batch_size * num_gpu_batches.
     gpu_batch_size: int
+    # How many gpu_batch_size chunks make up the full batch.
+    # >1 enables pipelining: load batch k+1's data while batch k computes.
     num_gpu_batches: int
 
-    # percent = a means a%
-    w_gpu_percent: float
-    w_cpu_percent: float
-    cache_gpu_percent: float
-    cache_cpu_percent: float
-    act_gpu_percent: float
-    act_cpu_percent: float
+    # Each pair (gpu%, cpu%) sums with disk% to 100.
+    # e.g. w_gpu_percent=100, w_cpu_percent=0 → all weights on GPU VRAM.
+    # e.g. cache_gpu_percent=0, cache_cpu_percent=100 → KV cache on CPU RAM.
+    w_gpu_percent: float    # % of model weights stored on GPU
+    w_cpu_percent: float    # % of model weights stored on CPU
+    cache_gpu_percent: float  # % of KV cache stored on GPU
+    cache_cpu_percent: float  # % of KV cache stored on CPU
+    act_gpu_percent: float    # % of activations (hidden states) stored on GPU
+    act_cpu_percent: float    # % of activations stored on CPU
 
-    # Whether to overlap the I/O and compute
+    # If True, weight/cache loads for layer j+1 run on a separate CUDA stream
+    # while layer j is computing — hiding PCIe transfer latency behind compute.
     overlap: bool
 
-    # Whether to separate attention and mlp as two layers
+    # If True, SelfAttention and MLP are treated as two separate layers in the
+    # pipeline, allowing finer-grained overlap of I/O and compute.
     sep_layer: bool
 
-    # Whether to use pinned memory for weights on CPU
+    # Pinned (page-locked) CPU memory enables faster DMA to GPU.
+    # Costs more CPU RAM but reduces PCIe transfer time for weights.
     pin_weight: bool
 
-    # Whether to compute attention on CPU
+    # If True, attention QKV matmuls run on CPU instead of GPU.
+    # Useful when the KV cache is on CPU to avoid the GPU→CPU→GPU round-trip.
     cpu_cache_compute: bool
 
-    # Sparsity of attention weights
+    # Fraction of V tokens to attend to (1.0 = dense, <1.0 = sparse top-k).
     attn_sparsity: float
 
-    # Compress weights with group-wise quantization
+    # 4-bit group-wise quantization for weights — reduces weight size ~4x.
     compress_weight: bool
     comp_weight_config: CompressionConfig
 
-    # Compress KV cache with group-wise quantization
+    # 4-bit group-wise quantization for KV cache — reduces KV size ~4x.
+    # Used by the "int4" benchmark scheme.
     compress_cache: bool
     comp_cache_config: CompressionConfig
 
@@ -90,6 +101,11 @@ def get_choice(cur_percent, percents, choices):
 
 
 def init_weight_list(weight_specs, policy, env):
+    # weight_specs: list of (shape, dtype, filename) tuples — one per tensor.
+    # policy: controls what % of total weight bytes go to disk/cpu/gpu.
+    # env: holds the three TorchDevice objects (gpu, cpu, disk).
+
+    # Order matters: disk gets the lowest percentile slice, gpu the highest.
     dev_percents = [policy.w_disk_percent, policy.w_cpu_percent, policy.w_gpu_percent]
     dev_choices = [env.disk, env.cpu, env.gpu]
 
@@ -97,10 +113,16 @@ def init_weight_list(weight_specs, policy, env):
     sizes_cumsum = np.cumsum(sizes)
     ret = []
     for i in range(len(weight_specs)):
+        # Use the midpoint of this tensor's byte range as its representative
+        # percentile in the total weight pool. This ensures large matrices are
+        # split correctly across device boundaries rather than assigned by index.
         mid_percent = (sizes_cumsum[i] - sizes[i] / 2) / sizes_cumsum[-1]
         home = get_choice(mid_percent * 100, dev_percents, dev_choices)
         shape, dtype, filename = weight_specs[i]
 
+        # 1D tensors (biases, layer norm scales) are tiny — always pin them and
+        # never compress them, regardless of policy. Only large 2D weight matrices
+        # are worth compressing and their pin behavior follows the policy setting.
         if len(shape) < 2:
             pin_memory = True
             compress = False
@@ -336,13 +358,15 @@ class SelfAttention:
         cache_home.store(cache)
 
     def load_cache(self, cache_home, cache_read_buf, i):
+        # i is the decode step index. i==0 means prefill — no past KV exists yet.
         if i == 0:  # prefill, no cache
             return
 
         k_home, v_home = cache_home.val
 
-        # Pick code path
+        # Three code paths depending on where the cache lives and where compute runs.
         if self.policy.compress_cache:
+            # Path 0 also handles compressed cache — decompress happens inside mha_gen.
             path = 0
             dst = self.attention_compute.compressed_device
         else:
@@ -356,22 +380,28 @@ class SelfAttention:
                 path = 0
             dst = self.attention_compute
 
-        if path == 0:  # Direct copy
+        if path == 0:  # Direct copy: cache is on GPU or compute is on GPU
+            # Copy the slice [0 : prompt_len + i] — all tokens seen so far.
             # shape: (s, b * n_head, head_dim)
             indices = (slice(0, self.task.prompt_len + i),
                        slice(0, k_home.shape[1]))
 
             if self.policy.attn_sparsity >= 1.0:
+                # Dense attention: load both K and V to the compute device.
                 cache_read_buf.store((
                     k_home.smart_copy(dst, indices),
                     v_home.smart_copy(dst, indices),
                 ))
             else:
+                # Sparse attention: only K is needed up front to compute scores;
+                # V is fetched selectively inside _sparse_attention_value.
                 cache_read_buf.store((
                     k_home.smart_copy(dst, indices),
                     (v_home, False),
                 ))
         elif path == 1:  # Copy to CPU temporary workspace
+            # Cache is on CPU/disk and attention computes on CPU.
+            # A pre-allocated float32 workspace buffer avoids repeated allocation.
             # shape: (s, b * n_head, head_dim)
             k_buf, v_buf = dst.next_attention_compute_workspace()
             indices = (slice(0, self.task.prompt_len + i - 1),
@@ -383,10 +413,9 @@ class SelfAttention:
                 cache_read_buf.store(((k_buf, False), (v_buf, False)))
             else:
                 cache_read_buf.store(((k_buf, False), ((v_home, v_buf), False)))
-        elif path == 2:  # Copy to both GPU and CPU
-            # The caches are stored on both GPU and other devices.
-            # Compute attention on gpu for caches stored on gpu.
-            # Compute attention on cpu for caches stored on cpu/disk.
+        elif path == 2:  # Split: part of cache on GPU, rest on CPU
+            # Mixed device: GPU portion is computed on GPU, CPU portion on CPU,
+            # then results are merged. Allows batches larger than GPU VRAM.
             gpu_k_buf = k_home.data[0][0]
             gpu_v_buf = v_home.data[0][0]
 
@@ -426,8 +455,13 @@ class SelfAttention:
 
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
                 cache_write_buf, i, k):
+        # i = token step (0 = prefill, >0 = decode). k = GPU batch index.
         n_head = self.config.n_head
 
+        # donate[n] = True means this tensor can be freed after use.
+        # On the last GPU batch we pop (consume) the weight buffer, marking
+        # weights as donate=True so they are freed once compute finishes.
+        # On earlier batches we peek (val) so the same weights are reused.
         donate = [False] * 14
         h, donate[0] = hidden.val, True
 
@@ -441,19 +475,22 @@ class SelfAttention:
              (w_v, _), (b_v, _), (w_out, _), (b_out, _),
              (w_ln, _), (b_ln, _)) = weight_read_buf.val
 
-        if i == 0:  # prefill
+        if i == 0:  # prefill: process the full input prompt in one shot
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
             h, new_k_cache, new_v_cache = self.compute.mha(h, mask, w_q, b_q,
                 w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head, donate,
                 self.policy.compress_cache, self.policy.comp_cache_config)
+            # Store the full KV cache produced by prefill to cache_home later
             cache_write_buf.store((new_k_cache, new_v_cache))
-        else:  # decoding
+        else:  # decoding: process one new token, attending over all past tokens
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
+            # Pop the KV cache that was loaded by load_cache into cache_read_buf
             (k_cache, donate[12]), (v_cache, donate[13]) = cache_read_buf.pop()
             h, new_k_cache, new_v_cache = self.compute.mha_gen(h, mask, w_q,
                 b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head,
                 k_cache, v_cache, donate, self.policy.attn_sparsity,
                 self.policy.compress_cache, self.policy.comp_cache_config)
+            # Store the single new KV token to be appended to cache_home
             cache_write_buf.store((new_k_cache, new_v_cache))
 
         hidden.val = h
@@ -614,7 +651,12 @@ class OptLM:
         else:
             raise NotImplementedError()
 
-        # CUDA streams
+        # Three CUDA streams allow I/O and compute to run in parallel:
+        # - load_weight_stream: DMA weights from CPU/disk → GPU
+        # - load_cache_stream:  DMA KV cache from CPU/disk → GPU
+        # - store_cache_stream: DMA new KV token from GPU → CPU/disk
+        # While the GPU computes layer j on the default stream, these streams
+        # are simultaneously transferring data for layer j+1.
         self.load_weight_stream = torch.cuda.Stream()
         self.load_cache_stream = torch.cuda.Stream()
         self.store_cache_stream = torch.cuda.Stream()
@@ -624,13 +666,15 @@ class OptLM:
         # for the i-th token, j-th layer, k-th gpu batch.
         num_layers, num_gpu_batches = self.num_layers, self.policy.num_gpu_batches
 
-        # cache[j][k]
+        # cache_home:      permanent KV storage on its assigned device (GPU/CPU/disk)
+        # cache_read_buf:  staging area — KV is copied here just before compute
+        # cache_write_buf: staging area — new KV is written here, then flushed to home
         self.cache_home = array_2d(num_layers, num_gpu_batches, ValueHolder)
         self.cache_read_buf = array_2d(num_layers, num_gpu_batches, ValueHolder)
         self.cache_write_buf = array_2d(num_layers, num_gpu_batches, ValueHolder)
-        # weight[j]
+        # weight_read_buf: weights are copied from home device to here before compute
         self.weight_read_buf = array_1d(num_layers, ValueHolder)
-        # attention_mask[k]
+        # attention_mask[k]: one mask per GPU batch, extended by 1 each decode step
         self.attention_mask = array_1d(num_gpu_batches, ValueHolder)
 
         self.task = None
@@ -910,6 +954,9 @@ class OptLM:
         return self.output_ids
 
     def generation_loop_normal(self):
+        # Simple sequential loop — no I/O and compute overlap.
+        # Every operation blocks until complete (sync after each layer).
+        # Used for debugging or when --overlap false is set.
         for i in range(self.execute_gen_len):
             timers("generate").start()
             for k in range(self.num_gpu_batches):
@@ -1010,7 +1057,12 @@ class OptLM:
                 print(f"{name:22s} (per-batch): {np.mean(costs):.6f} s")
 
     def generation_loop_overlap_single_batch(self):
-        # Prologue
+        # Pipelined loop for a single GPU batch. The key idea:
+        # while layer j computes on the default CUDA stream, the load/store
+        # streams are simultaneously transferring data for j+1 and j-1.
+        # This hides most of the PCIe transfer latency behind GPU compute.
+
+        # Prologue: pre-load layer 0 weights before the loop starts
         for k in range(self.num_gpu_batches):
             self.load_weight(0, 0, k)
         self.sync()
@@ -1020,13 +1072,13 @@ class OptLM:
             timers("generate").start()
             self.update_attention_mask(i, 0)
             for j in range(self.num_layers):
-                self.load_weight(i, j+1, 0)
-                self.load_cache(i, j+1, 0)
+                self.load_weight(i, j+1, 0)   # prefetch NEXT layer's weights
+                self.load_cache(i, j+1, 0)    # prefetch NEXT layer's KV cache
                 self.load_hidden(i, j, 0)
-                self.compute_layer(i, j, 0)
-                self.store_cache(i, j-1, 0)
+                self.compute_layer(i, j, 0)   # compute CURRENT layer
+                self.store_cache(i, j-1, 0)   # write back PREVIOUS layer's new KV
                 self.store_hidden(i, j, 0)
-                self.sync()
+                self.sync()                   # wait for all streams before next layer
             timers("generate").stop()
 
             if self.task.stop and np.all(self.stopped):
@@ -1216,6 +1268,9 @@ def run_flexgen(args):
     model = OptLM(opt_config, env, args.path, policy)
 
     try:
+        # Warmup: run one token through the model to trigger CUDA JIT compilation,
+        # weight page faults, and any first-run overhead — so the timed run below
+        # reflects steady-state performance only.
         output_ids = model.generate(
             warmup_inputs, max_new_tokens=1, verbose=args.verbose)
 
