@@ -709,15 +709,34 @@ class OptLM:
         else:
             raise NotImplementedError()
 
-        # CUDA streams
+        # Each CUDA stream runs independently of the default stream, letting
+        # memory transfers and compute overlap. Without separate streams,
+        # every operation would serialize on the default stream.
+
+        # Transfers weight tensors from their offload home (CPU/disk) into the
+        # GPU read buffer while the previous layer is still computing.
         self.load_weight_stream = torch.cuda.Stream()
+
+        # Transfers KV-cache tensors from CPU DRAM into the GPU read buffer
+        # concurrently with weight loading or compute.
         self.load_cache_stream = torch.cuda.Stream()
+
+        # Writes updated KV-cache entries back to CPU DRAM after each attention
+        # step, overlapping with the next layer's compute.
         self.store_cache_stream = torch.cuda.Stream()
+
+        # Used by InfiniGen's speculative KV fetching (mha_gen): runs the cheap
+        # partial-weight dot-product that predicts which KV tokens are critical,
+        # so the result is ready before the full attention kernel starts.
         self.speculation_stream = torch.cuda.Stream()
-        # CUDA streams [j][k]
+
+        # Prefetches the next attention layer's KV cache from CPU to GPU while
+        # the current attention layer is computing, hiding the PCIe transfer latency.
         self.prefetch_cache_stream = torch.cuda.Stream()
 
-        # Event (To start self attention after prefetching)
+        # Signals that prefetch_cache_stream has finished loading the KV cache.
+        # Recorded after prefetch_cache() and waited on before self-attention
+        # begins, ensuring the GPU does not read incomplete cache data.
         self.prefetch_evt = torch.cuda.Event()
 
         # Intermediate tensors
@@ -1370,31 +1389,80 @@ def run_flexgen(args):
     inputs = get_inputs(prompt_len, num_prompts, tokenizer, args.test_input_path)
 
     # ── Execution environment ─────────────────────────────────────────────────
-    # Three storage tiers: GPU VRAM, CPU DRAM, and disk (for tensor offloading).
-    # TorchMixedDevice allows tensors to be split across all three simultaneously.
+    # Three storage tiers that FlexGen offloads tensors across:
+    #
+    # gpu  — wraps cuda:0; allocates tensors in GPU VRAM and runs attention/FFN
+    #        kernels. Fastest but smallest capacity (~24 GB on an A100).
+    #
+    # cpu  — wraps the host CPU; allocates pinned (page-locked) memory by default
+    #        so PCIe transfers to/from the GPU are as fast as possible.
+    #        Holds KV cache when percent[2..3] = "0 100" (as in run.sh).
+    #
+    # disk — manages tensors saved as memory-mapped files under args.offload_dir.
+    #        Spawns 4 background copy threads (copy_worker_func) to stream
+    #        tensors to/from disk asynchronously while the GPU computes.
     gpu = TorchDevice("cuda:0")
     cpu = TorchDevice("cpu")
     disk = TorchDisk(args.offload_dir)
     env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
 
     # ── Offloading policy ─────────────────────────────────────────────────────
-    # percent[0..1]: GPU/CPU % for weights   (run.sh: 100 0  → weights on GPU)
-    # percent[2..3]: GPU/CPU % for KV cache  (run.sh:  0 100 → KV cache on CPU)
-    # percent[4..5]: GPU/CPU % for activations (run.sh: 100 0 → activations on GPU)
-    # compress_weight uses 4-bit group quantization along dim 0 (output channels).
-    # compress_cache uses 4-bit group quantization along dim 2 (sequence dimension).
-    policy = Policy(args.gpu_batch_size, args.num_gpu_batches,
-                    args.percent[0], args.percent[1],
-                    args.percent[2], args.percent[3],
-                    args.percent[4], args.percent[5],
-                    args.overlap, args.sep_layer, args.pin_weight,
-                    args.cpu_cache_compute, args.attn_sparsity,
-                    args.compress_weight,
-                    CompressionConfig(num_bits=4, group_size=64,
-                                      group_dim=0, symmetric=False),
-                    args.compress_cache,
-                    CompressionConfig(num_bits=4, group_size=64,
-                                      group_dim=2, symmetric=False))
+    policy = Policy(
+        # Number of prompts processed per GPU kernel call.
+        # run.sh: --gpu-batch-size 20
+        args.gpu_batch_size,
+
+        # How many gpu_batch_size chunks to pipeline per decode step.
+        # run.sh: --num-gpu-batches 1  (no pipelining, single pass)
+        args.num_gpu_batches,
+
+        # Weight offloading split: (GPU%, CPU%, disk% is inferred as 100-GPU-CPU).
+        # run.sh: 100 0 → all weights stay in GPU VRAM, nothing offloaded to CPU/disk.
+        args.percent[0],   # w_gpu_percent
+        args.percent[1],   # w_cpu_percent
+
+        # KV-cache offloading split across GPU/CPU (disk% inferred).
+        # run.sh: 0 100 → entire KV cache lives in CPU DRAM (pinned), streamed to GPU per step.
+        args.percent[2],   # cache_gpu_percent
+        args.percent[3],   # cache_cpu_percent
+
+        # Activation offloading split. Activations are small so keeping them on GPU is fine.
+        # run.sh: 100 0 → activations remain in GPU VRAM.
+        args.percent[4],   # act_gpu_percent
+        args.percent[5],   # act_cpu_percent
+
+        # Overlap I/O with compute: prefetch next layer's weights/cache while
+        # the GPU is computing the current layer, hiding transfer latency.
+        args.overlap,
+
+        # Treat attention and MLP as separate offload layers instead of one fused layer,
+        # giving finer-grained control over what gets prefetched when.
+        args.sep_layer,
+
+        # Keep CPU-resident weights in pinned (page-locked) memory so PCIe
+        # transfers are DMA-driven and don't stall the CPU.
+        args.pin_weight,
+
+        # Run KV-cache attention score computation on the CPU instead of the GPU.
+        # Useful when the KV cache is already in CPU DRAM to avoid a round-trip transfer.
+        args.cpu_cache_compute,
+
+        # Fraction of attention weights to keep (1.0 = dense, <1.0 = sparse/H2O eviction).
+        # run.sh "infinigen" scheme leaves this at default (1.0, no sparsity).
+        args.attn_sparsity,
+
+        # Enable 4-bit group-wise quantization of model weights to cut weight size ~4×.
+        args.compress_weight,
+        # Weight compression config: 4-bit, groups of 64 along dim 0 (output-channel axis),
+        # asymmetric (zero-point stored per group).
+        CompressionConfig(num_bits=4, group_size=64, group_dim=0, symmetric=False),
+
+        # Enable 4-bit group-wise quantization of the KV cache ("int4" scheme in run.sh).
+        args.compress_cache,
+        # KV-cache compression config: 4-bit, groups of 64 along dim 2 (sequence axis),
+        # asymmetric. dim 2 is chosen because token values vary along the sequence dimension.
+        CompressionConfig(num_bits=4, group_size=64, group_dim=2, symmetric=False),
+    )
     # KV-cache compression and attention sparsity (H2O-style eviction) cannot
     # be combined — the sparse attention path assumes full-precision cache entries.
     assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"

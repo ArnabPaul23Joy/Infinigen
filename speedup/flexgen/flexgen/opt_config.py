@@ -43,9 +43,23 @@ class OptConfig:
         self.vocab_size * (h + 1))
 
     def cache_bytes(self, batch_size, seq_len):
+        # Total bytes for the KV cache across all transformer layers.
+        # Each layer stores a K tensor and a V tensor (factor of 2),
+        # each of shape (batch_size, seq_len, input_dim) in float16 (2 bytes).
+        # Formula: 2 (K+V) * batch_size * seq_len * num_hidden_layers * input_dim * 2 (bytes/elem)
+        #
+        # batch_size     — number of prompts processed in parallel (num_gpu_batches * gpu_batch_size)
+        # seq_len        — prompt_len + gen_len: the full sequence each cache entry must cover
         return 2 * batch_size * seq_len * self.num_hidden_layers * self.input_dim * 2
 
     def hidden_bytes(self, batch_size, seq_len):
+        # Total bytes for one hidden-state tensor (activations) covering the full sequence.
+        # Shape is (batch_size, seq_len, input_dim) in float16 (2 bytes per element).
+        # Unlike the KV cache, activations are not duplicated per layer — only one
+        # layer's activations exist in memory at a time during the forward pass.
+        #
+        # batch_size — number of prompts processed in parallel
+        # seq_len    — prompt_len + gen_len
         return batch_size * seq_len * self.input_dim * 2
 
 
