@@ -266,7 +266,16 @@ class OutputEmbed:
 
 
 class SelfAttention:
+    # One instance per transformer layer. Holds layer-specific state (weights
+    # are stored externally in weight_home; this class only orchestrates how
+    # they are loaded, used, and how the KV cache is read/written).
+
     def __init__(self, config, env, policy, layer_id, enable_prefetching, partial_weight_ratio=0.2, alpha=4, max_num_kv=400):
+        # Called once when OptLM builds the model graph (per layer).
+        # Stores config and InfiniGen knobs but does not allocate or load anything yet.
+        # NOTE: layers 0 and 1 set partial_weight_ratio=None — InfiniGen's speculative
+        # prefetching only begins from layer 2, since layer 0/1 lack a "previous"
+        # attention layer whose output can drive prediction.
         self.config = config
         self.env = env
         self.layer_id = layer_id
@@ -290,9 +299,18 @@ class SelfAttention:
             self.partial_weight_ratio = None
 
     def set_task(self, task):
+        # Called once per generate() call by OptLM.set_task. Records the active
+        # task (prompt_len, gen_len, stop tokens) so subsequent methods can
+        # reference task.prompt_len when slicing the KV cache.
         self.task = task
 
     def init_weight(self, weight_home, path):
+        # Called once at model construction (from OptLM.init_weight). This is
+        # where weights are loaded from .npy files on disk into their offload
+        # homes (GPU/CPU/disk per the policy). The actual file read happens
+        # in init_weight_list → load_from_np_file (see line 119).
+        # After loading, Q's weight is concatenated with its bias into an
+        # (h, h+1) matrix (InfiniGen's "skewing" trick for cheaper speculation).
         h, dtype = (self.config.input_dim, self.config.dtype)
         path = os.path.join(os.path.join(path, f"decoder.layers.{self.layer_id}.self_attn"))
         weight_specs = [
@@ -330,6 +348,11 @@ class SelfAttention:
         weight_home.store(weights)
 
     def load_weight(self, weight_home, weight_read_buf, k):
+        # Called every decode step on load_weight_stream. Issues async copies of
+        # this layer's weights (Q/K/V/out/LN) from weight_home to GPU memory,
+        # storing them in weight_read_buf where forward() will pick them up.
+        # Only fires on k==0 because all gpu-batches in the same layer share
+        # the same weights — no need to re-copy per batch.
         w_q, b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln = weight_home.val
         if k == 0:
             dst1 = self.weight_load_dst
@@ -342,6 +365,12 @@ class SelfAttention:
                 w_ln.smart_copy(dst2), b_ln.smart_copy(dst2)))
 
     def init_cache_one_gpu_batch(self, cache_home):
+        # Called once per gpu-batch at the start of generation. Allocates the
+        # empty KV-cache tensor on its offload home (GPU / CPU / disk / mixed)
+        # based on the policy. Run.sh's config (--percent 0 100 for cache) puts
+        # the entire KV cache in CPU DRAM here.
+        # For InfiniGen layers (layer_id > 1) it also pre-allocates a small
+        # pinned-memory buffer (prefetch_kv) used by prefetch_cache().
         if self.policy.cache_gpu_percent == 100:
             device = self.env.gpu
         elif self.policy.cache_cpu_percent == 100:
@@ -361,6 +390,13 @@ class SelfAttention:
             self.prefetch_kv = device.allocate((2, self.max_num_kv, cache_home.val[0].shape[1], cache_home.val[0].shape[2]), np.float16, pin_memory=True)
 
     def load_cache(self, cache_home, cache_read_buf, i):
+        # Called every decode step (i > 0) on load_cache_stream. Streams the KV
+        # cache slice for tokens [0..prompt_len+i) from cache_home (CPU DRAM)
+        # to GPU memory, storing it in cache_read_buf for forward() to consume.
+        # Branches into 3 code paths:
+        #   path 0 — direct copy to GPU (default).
+        #   path 1 — copy to a CPU workspace when attention runs on the CPU.
+        #   path 2 — split copy when the cache is partially on GPU and partially on CPU.
         if i == 0:  # prefill, no cache
             return
 
@@ -428,6 +464,12 @@ class SelfAttention:
             raise ValueError(f"Invalid path: {path}")
     
     def prefetch_cache(self, cache_home, cache_read_buf, i, prefetch_idx, prefetch_cache_stream):
+        # InfiniGen-only. Called from generation_loop after the previous
+        # attention layer has predicted which KV tokens are critical
+        # (prefetch_idx). Speculatively copies only those rows from cache_home
+        # to GPU on prefetch_cache_stream — much smaller and faster than a full
+        # load_cache transfer. The result lands in cache_read_buf so forward()
+        # can use it instead of the full cache.
         if i == 0:  # prefill, no cache
             return
 
@@ -469,6 +511,11 @@ class SelfAttention:
             raise ValueError(f"Invalid path: {path}")
 
     def store_cache(self, cache_home, cache_write_buf, i):
+        # Called every decode step on store_cache_stream after forward() has
+        # produced the new K/V tensors for token i. Writes them into the
+        # correct slice of cache_home so future steps can reference them.
+        # Skipped on the very last token (i == gen_len-1) since no further
+        # step will read it.
         # shape: (s, b * n_head, head_dim)
         k_home, v_home = cache_home.val
         k_new, v_new = cache_write_buf.pop()
@@ -488,10 +535,24 @@ class SelfAttention:
         general_copy(v_home, indices, v_new, None)
 
     def input_act_shape_and_dtype(self, batch_size, seq_len):
+        # Returns the expected input activation shape/dtype for this layer.
+        # NOTE: dead code — defined here (and on InputEmbed/OutputEmbed/MLP)
+        # but never actually invoked anywhere in the repo.
         return (batch_size, seq_len, self.config.input_dim), self.config.dtype
 
     def forward(self, hidden, cache_read_buf, weight_read_buf, attention_mask,
                 cache_write_buf, i, k, warmup, partial_weight_read_buf, partial_cache_read_buf, speculation_stream, prev_partial_cache_read_buf, prev_partial_weight_read_buf, weight_home):
+        # The actual compute step. Called every (i, j, k) by compute_layer.
+        # Branches:
+        #   i == 0 (prefill) — runs the full self.compute.mha kernel over the
+        #       prompt; on the warmup pass it also computes the partial Q/K
+        #       weights ("skewed" weights) used later for speculation.
+        #   i > 0  (decode)  — runs self.compute.mha_gen with the prefetched KV
+        #       cache. If enable_prefetching is True, mha_gen also produces the
+        #       prefetch_idx for the *next* layer's speculative cache fetch.
+        # Updates to the KV cache go into cache_write_buf, picked up by
+        # store_cache(). The new partial cache for the previous attention
+        # layer is also pushed to prev_partial_cache_read_buf.
         n_head = self.config.n_head
 
         donate = [False] * 14
@@ -740,22 +801,48 @@ class OptLM:
         self.prefetch_evt = torch.cuda.Event()
 
         # Intermediate tensors
-        # The following buffers store values used
-        # for the i-th token, j-th layer, k-th gpu batch.
+        # Buffers are indexed by [layer j][gpu_batch k]. Each cell is a
+        # ValueHolder — a one-slot container with store()/pop() that enforces
+        # the producer→consumer handoff between the prefetch and compute steps.
         num_layers, num_gpu_batches = self.num_layers, self.policy.num_gpu_batches
 
-        # cache[j][k]
+        # Permanent home of each layer's KV cache in its offload location
+        # (CPU DRAM in run.sh's config). Written once during init_cache and
+        # read/written every decode step via load_cache / store_cache.
         self.cache_home = array_2d(num_layers, num_gpu_batches, ValueHolder)
+
+        # Staging buffer for KV cache that has been prefetched from cache_home
+        # to the GPU and is ready for the attention kernel to consume.
+        # Filled by load_cache_stream, drained by compute_layer → forward().
         self.cache_read_buf = array_2d(num_layers, num_gpu_batches, ValueHolder)
+
+        # Staging buffer for updated KV entries produced by the attention kernel.
+        # Filled by compute_layer → forward(), drained by store_cache_stream
+        # which writes them back to cache_home.
         self.cache_write_buf = array_2d(num_layers, num_gpu_batches, ValueHolder)
+
+        # InfiniGen-specific: holds the small subset of KV tokens fetched during
+        # speculative prefetching (prefetch_cache). Used by mha_gen to identify
+        # which full KV rows are critical before the real cache transfer begins.
         self.partial_cache_read_buf = array_2d(num_layers, num_gpu_batches, ValueHolder)
-        # weight[j]
+
+        # Staging buffer for full layer weights prefetched from weight_home to
+        # the GPU. Shared across all k batches of a layer (weights are the same
+        # regardless of which prompt batch is being processed).
         self.weight_read_buf = array_1d(num_layers, ValueHolder)
+
+        # InfiniGen-specific: holds the small partial Q/K weight columns used
+        # by speculation_stream to cheaply predict critical KV tokens without
+        # loading the full weight matrices first.
         self.partial_weight_read_buf = array_1d(num_layers, ValueHolder)
-        # attention_mask[k]
+
+        # Attention mask for each gpu batch, shaped (gpu_batch_size, seq_len).
+        # One entry per k-batch; reused across all layers for the same token step.
         self.attention_mask = array_1d(num_gpu_batches, ValueHolder)
 
+        # No active task yet; set by set_task() before each generate() call.
         self.task = None
+        # Allocate and place all layer weights into their offload homes.
         self.init_all_weights()
 
     def set_task(self, task):
@@ -880,18 +967,26 @@ class OptLM:
                 return
 
         # Load to hidden states buffers
-        dst = self.layers[j].compute
+        dst = self.layers[j].compute  # GPU device that will execute layer j
         if j == 0:
+            # First layer has no predecessor layer to pull hidden states from;
+            # its input is the raw token-id tensor sliced for this gpu batch k.
             gpu_batch_size = self.policy.gpu_batch_size
             left, right = k * gpu_batch_size, (k + 1) * gpu_batch_size
-            if i == 0:  # load from the input ids
+            if i == 0:
+                # Prefill step: load the full prompt (shape: gpu_batch_size, prompt_len).
                 val = dst.allocate((gpu_batch_size, self.task.prompt_len), np.int32)
                 val.load_from_np(self.output_ids[left:right, :self.task.prompt_len])
-            else:  # load from the last generated token
+            else:
+                # Decoding step i: load only the single token generated at
+                # position (prompt_len + i - 1) — the token emitted last step.
                 pos = self.task.prompt_len + i
                 val = dst.allocate((gpu_batch_size, 1), np.int32)
                 val.load_from_np(self.output_ids[left:right, pos-1:pos])
-        else:  # load from the last layer
+        else:
+            # Middle/last layers: consume the hidden state produced by layer
+            # j-1 for the same (generation step i, gpu batch k). pop() frees
+            # the buffer on the source device; move() transfers it to dst.
             val = self.hidden[i][j-1][k].pop().move(dst)
         self.hidden[i][j][k].store(val)
 
@@ -962,17 +1057,28 @@ class OptLM:
             self.delete_weight(j, 0)
 
     def update_attention_mask(self, i, k):
+        # Maintains the boolean attention mask for the k-th GPU batch across
+        # generation steps. The mask marks which positions are real tokens
+        # (True) versus padding (False), so attention can ignore padded slots.
         if i > 0:
+            # Decoding step: a new token has just been produced and appended
+            # to the sequence, so extend the existing mask by one True entry
+            # to cover that newly generated position.
             mask = self.attention_mask[k]
             assert mask.val is not None
             mask.val = mask.val.device.extend_attention_mask(mask.val, [True])
             return
 
+        # Prefill step (i == 0): build the initial mask from the prompt by
+        # selecting this batch's slice of input_ids and marking every
+        # non-pad token as True.
         gpu_batch_size = self.policy.gpu_batch_size
         left = k * gpu_batch_size
         right = left + gpu_batch_size
         input_ids = self.output_ids[left:right, :self.task.prompt_len]
 
+        # Allocate the mask on CPU when the cache is computed on CPU, else
+        # on GPU, so the mask lives on the same device as the attention op.
         attention_compute = (self.env.cpu if self.policy.cpu_cache_compute
             else self.env.gpu)
         val = attention_compute.allocate(

@@ -78,7 +78,24 @@ def skew(query, key, wq, wk, n_head, head_dim):
         sq = sq * sk
         A = torch.zeros(head_dim, head_dim).to(query.device).to(torch.float16)
         _, ind = sq.sort()
+        # Build the per-head rotation matrix A by column-permuting vq.
+        # scatter writes column j of vq into column ind[j] of A for every row:
+        #   A[:, ind[j]] = vq[:, j]
+        # ind is the ascending sort of sq (joint Q*K singular values), so
+        # vq's most-important direction (largest sq) ends up at ind[head_dim-1]
+        # and vq's least-important direction ends up at ind[0]. The result is
+        # a permutation of vq's columns ordered by ascending joint importance.
         A = A.scatter(-1, ind.unsqueeze(0).repeat(head_dim, 1), vq)
+
+        # Apply A^T as a change-of-basis to the head's rows of W_Q and W_K.
+        # After this, projecting hidden states with the new weights is
+        # equivalent to projecting with the originals and then rotating by A:
+        #   new_q = hidden @ (A^T W_Q)^T = hidden @ W_Q^T @ A = old_q @ A
+        # Because A is built from orthonormal columns of vq, A^T A ≈ I, so
+        # attention scores Q K^T are preserved — correctness is unaffected.
+        # The payoff: old_q @ A reorders columns by joint Q*K importance,
+        # concentrating attention-score energy into a small prefix of columns
+        # that partial_weight_index_generation can cheaply identify later.
         wq[start:end, :] = A.t() @ wq[start:end]
         wk[start:end, :] = A.t() @ wk[start:end]
     return wq, wk

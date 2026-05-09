@@ -57,11 +57,30 @@ def set_partial_cache(k_cache, partial_index, n_head, head_dim):
     """
 
     n, bh, _ = k_cache.shape
+
+    # torch.gather(input, dim, index) selects values from `input` along `dim`
+    # using positions given by `index`. output[i,j,k,l] = input[i,j,k, index[i,j,k,l]]
+    # All four tensors must have the same number of dimensions and the same
+    # size on every axis *other* than the gather dimension.
     partial_cache = torch.gather(
+        # input — reshape k_cache from (n, b*n_head, head_dim) to
+        # (n, b, n_head, head_dim) so the per-head column axis (dim 3)
+        # is explicit and addressable.
         k_cache.view(n, -1, n_head, head_dim),
+
+        # dim=3 — gather along the head_dim axis, i.e. select a subset of
+        # the d columns for each token, batch, and head independently.
         3,
+
+        # index — partial_index has shape (b, n_head, d') where d' is the
+        # number of top-k columns. unsqueeze(0) adds the token axis to give
+        # (1, b, n_head, d'), then repeat(n, 1, 1, 1) broadcasts it to
+        # (n, b, n_head, d') so every token position uses the same column
+        # indices (the important columns are the same for all tokens).
         partial_index.unsqueeze(0).repeat(n, 1, 1, 1),
     )
+    # Flatten (n, b, n_head, d') back to (n, b*n_head, d') to match the
+    # layout the rest of the pipeline expects for the key cache.
     return partial_cache.view(n, bh, -1)
 
 
