@@ -301,7 +301,22 @@ class TorchDevice:
 
     def mha(self, inputs, attention_mask, w_q, b_q, w_k, b_k, w_v, b_v,
             w_out, b_out, w_ln, b_ln, n_head, donate, compress_cache, comp_config, warmup=False, partial_weight_ratio=0.1):
-        """Multi-head attention (prefill phase)."""
+        """Multi-head attention for the prefill phase.
+
+        InfiniGen extends FlexGen's vanilla prefill with two paper-defined
+        responsibilities, both gated by the `warmup` flag:
+
+        - Offline (warmup pass, run once on a representative/static input):
+          rewrite W_Q and W_K with the SVD-based skewing transform from
+          Section 4.1 so that a small subset of columns concentrates most of
+          the attention-score energy. The skewed weights are persisted back
+          into `weight_home` by the caller and reused for every real prompt.
+
+        - Online (real prompts): from the prompt's own Q matrix, pick the
+          per-head top-k column indices (`partial_weight_index`) that will
+          define the partial Q-weight and partial K-cache used later for
+          speculative attention during decoding (Section 4.2).
+        """
         # decompress weights
         if w_q.device.device_type == DeviceType.COMPRESSED:
             w_q = w_q.device.decompress(w_q)
@@ -314,26 +329,49 @@ class TorchDevice:
         scaling = head_dim ** -0.5
 
         hidden = F.layer_norm(inputs.data, (h,), weight=w_ln.data, bias=b_ln.data)
+        # Append a column of 1s so the bias term is folded into the (D, D+1)
+        # weight matrix used by the skewing trick — keeps Q/K/V projections as
+        # a single linear op with no separate bias add.
         new_h = reform_hidden_states(hidden)
 
+        # Standard Q/K/V projections. After warmup, w_q and w_k are the
+        # *skewed* weights produced by the offline phase.
         # shape: (b, s, h)
         q = F.linear(new_h, w_q.data, bias=None)
         k = F.linear(new_h, w_k.data, bias=None)
         v = F.linear(hidden, w_v.data, bias=b_v.data)
 
-        # Partial weight index generation
+        # InfiniGen online phase: choose which columns of the skewed Q/K
+        # constitute the "partial" weights for this layer, using |Q|-column
+        # sums on the prompt as the importance proxy (Section 4.2). Skipped
+        # during warmup because the skewing has not been applied yet, so
+        # column importance is not yet meaningful.
         partial_weight_index = None
         if (not warmup) and (partial_weight_ratio is not None):
             partial_weight_index = partial_weight_index_generation(q, n_head, head_dim, partial_weight_ratio)
+        # Split the flat hidden dimension h = n_head * head_dim into explicit
+        # head and per-head-dim axes. The linear projections above produced a
+        # single (b, s, h) tensor; this view exposes the n_head independent
+        # subspaces so subsequent permute → bmm ops process each head in
+        # parallel with no data copy. partial_weight_index_generation ran on
+        # the flat q intentionally (it indexes heads by manual [start:end]
+        # slices), so the reshape is deferred until after that call.
         # shape: (b, s, n_head, head_dim)
         q = q.view(b, s, n_head, head_dim)
         k = k.view(b, s, n_head, head_dim)
         v = v.view(b, s, n_head, head_dim)
 
-        # Generate skewing matrix
+        # InfiniGen offline phase (Section 4.1): per-head SVD on Q and K of
+        # the static input produces a rotation A that re-orders columns by
+        # joint Q/K singular-value magnitude. Applying A^T to W_Q and W_K
+        # leaves attention scores unchanged but concentrates them into a few
+        # columns — the prerequisite for accurate partial-weight speculation.
         if warmup:
             w_q.data, w_k.data = skew(q, k, w_q.data, w_k.data, n_head, head_dim)
 
+        # Reshape into per-head batches for the dense prefill attention
+        # (the standard FlexGen path; InfiniGen does not modify the prefill
+        # attention computation itself, only the surrounding weight prep).
         # shape: (b * n_head, s, head_dim)
         q = q.permute(0, 2, 1, 3).reshape(b * n_head, s, head_dim)
         # shape: (b * n_head, head_dim, s)
@@ -376,12 +414,35 @@ class TorchDevice:
             k = TorchTensor.create_from_torch(k, self)
             v = TorchTensor.create_from_torch(v, self)
 
+        # Returns are (value, K cache, V cache, possibly-updated w_q, w_k,
+        # partial column indices). The caller persists w_q/w_k back to
+        # weight_home during warmup, and uses partial_weight_index together
+        # with set_partial_weight/set_partial_cache to materialize the
+        # speculation tensors for the next decoding step.
         return TorchTensor.create_from_torch(value, self), k, v, w_q, w_k, partial_weight_index
 
     def mha_gen(self, inputs, attention_mask, w_q, b_q, w_k, b_k, w_v, b_v,
                 w_out, b_out, w_ln, b_ln, n_head, k_cache, v_cache, donate,
                 attn_sparsity, compress_cache, comp_config, p_w_q, partial_k_cache, speculation_stream, alpha, max_num_kv):
-        """Multi-head attention (decoding phase)."""
+        """Multi-head attention for the decoding phase (one new token).
+
+        InfiniGen overlays FlexGen's per-step decode attention with the
+        speculative-prefetch mechanism from Section 4.2 of the paper:
+
+        1. Using *this* layer's hidden state and the *next* layer's partial
+           Q-weight (`p_w_q`) and partial K-cache (`partial_k_cache`) — both
+           assembled in the prefill step from the skewed Q/K weights —
+           cheaply approximate the next layer's attention scores.
+        2. From those approximate scores, identify the "critical" KV tokens
+           (`prefetch_idx`) that the next attention layer will actually need.
+        3. The caller uses `prefetch_idx` to asynchronously stage only those
+           KV rows from CPU/disk to GPU before the next layer runs, hiding
+           offload latency behind compute.
+
+        The speculation runs on a separate CUDA stream so it overlaps with
+        the regular Q/K/V projection and dense attention compute path of the
+        current layer.
+        """
         # decompress weights
         if w_q.device.device_type == DeviceType.COMPRESSED:
             w_q = w_q.device.decompress(w_q)
@@ -390,18 +451,33 @@ class TorchDevice:
             w_out = w_out.device.decompress(w_out)
 
         b, tgt_s, h = inputs.shape
+        # src_s = number of cached tokens + the one we're producing now.
         src_s = min(attention_mask.shape[1], k_cache.shape[0] + 1)
         head_dim = h // n_head
         scaling = head_dim ** -0.5
 
         hidden = F.layer_norm(inputs.data, (h,), weight=w_ln.data, bias=b_ln.data)
+        # Append the column of 1s used by the bias-folded skewed projections.
         new_h = reform_hidden_states(hidden)
-        # Speculate attention
+
+        # ── InfiniGen speculation (Section 4.2) ──────────────────────────
+        # If partial weights were prepared in prefill, run an approximate
+        # attention for the *next* layer in parallel. `speculate_attention`
+        # produces per-head top-k token indices using the alpha-threshold
+        # rule from the paper (count tokens whose partial-attention score
+        # is within alpha of the per-head max, then pick that many tokens
+        # by score, capped at max_num_kv). p_w_q is None on layers 0/1 and
+        # whenever prefetching is disabled, in which case decoding falls
+        # back to FlexGen's regular dense/sparse attention.
         prefetch_idx = None
         if p_w_q is not None:
             with torch.cuda.stream(speculation_stream):
                 prefetch_idx = speculate_attention(new_h, p_w_q, partial_k_cache, n_head, alpha, max_num_kv)
 
+        # Full Q/K/V projection for the new token. w_q/w_k are the skewed
+        # weights from the warmup pass — exact attention is unchanged
+        # because skewing is a per-head orthogonal rotation absorbed into
+        # both Q and K (Section 4.1).
         # shape: (b, 1, h)
         q = F.linear(new_h, w_q.data, bias=None)
         k = F.linear(new_h, w_k.data, bias=None)
@@ -418,6 +494,11 @@ class TorchDevice:
         # shape: (1, b * n_head, head_dim)
         v_new = v.permute(1, 0, 2, 3).reshape(tgt_s, b * n_head, head_dim)
 
+        # The branches below are FlexGen's existing decode attention paths.
+        # In InfiniGen's intended deployment these run in parallel with the
+        # speculation kernel above, and the prefetch issued by the caller
+        # has already brought the relevant KV rows on-GPU by the time the
+        # *next* layer enters this function.
         if isinstance(k_cache, TorchTensor):
             if attn_sparsity >= 1.0:  # Dense attention
                 if compress_cache:
@@ -486,6 +567,10 @@ class TorchDevice:
             k_new = TorchTensor.create_from_torch(k_new, self)
             v_new = TorchTensor.create_from_torch(v_new, self)
 
+        # `prefetch_idx` is consumed by the caller (SelfAttention.forward) to
+        # asynchronously gather the critical KV rows for the next attention
+        # layer from CPU/disk into GPU memory — the core throughput win of
+        # InfiniGen over plain FlexGen offloading.
         return TorchTensor.create_from_torch(value, self), k_new, v_new, prefetch_idx
 
     def _attention_weights(self, q, k, mask, b, src_s, n_head):
