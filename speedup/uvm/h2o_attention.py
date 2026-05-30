@@ -1,3 +1,16 @@
+# H2O ("Heavy-Hitter Oracle") variant of the vanilla baseline in selfattention.py.
+#
+# Differences vs selfattention.py at a glance:
+#   - Constructor takes an extra `h2o_ratio` controlling how many heavy-hitter
+#     tokens are retained.
+#   - KV cache is grown dynamically (not pre-allocated to a fixed 2048 slots).
+#   - Maintains a running per-token attention accumulator `self.acc` and an
+#     iteration counter `self.i` (used to detect prefill).
+#   - After prefill, prunes the KV cache to only the top-k tokens by
+#     accumulated attention score (`_heavy_hitter_pruning`, new method).
+#   - During decode, evicts the *least* important cached token (argmin of
+#     `self.acc`) and writes the new K/V in its place, so the cache size
+#     stays bounded regardless of how many tokens are generated.
 import torch
 from torch import nn
 from typing import Tuple
@@ -9,7 +22,7 @@ class SelfAttention(nn.Module):
         self,
         embed_dim: int,
         num_heads: int,
-        h2o_ratio: float,
+        h2o_ratio: float,  # NEW vs selfattention.py: fraction of tokens kept as heavy-hitters
         bias: bool = True
     ):
         super().__init__()
@@ -29,6 +42,14 @@ class SelfAttention(nn.Module):
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias, dtype=torch.float16, device=torch.device('cuda'))
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias, dtype=torch.float16, device=torch.device('cuda'))
 
+        # H2O-only state. selfattention.py has no equivalent of these:
+        #   acc — running sum of attention scores per cached token; used to
+        #         rank tokens by cumulative importance for eviction.
+        #   ratio — kept fraction (e.g. 0.2 keeps top 20% as heavy-hitters).
+        #   i — step counter; i == 0 marks the prefill call.
+        # past_key_value starts as None and is built as a (key, value) tuple
+        # during the first forward, unlike selfattention.py which pre-allocates
+        # a single (2, bsz, num_heads, 2048, head_dim) tensor up front.
         self.acc = None
         self.ratio = h2o_ratio
         self.i = 0
@@ -36,7 +57,14 @@ class SelfAttention(nn.Module):
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
-    
+
+    # NEW vs selfattention.py: the entire heavy-hitter selection step.
+    # Called once right after prefill. Picks the `hh_k` cached tokens with the
+    # highest aggregate attention weight (summed across query positions) per
+    # head, drops the rest, and returns the pruned K/V plus the truncated
+    # accumulator. This is the core of the H2O algorithm — capping cache size
+    # to `hh_k` heavy-hitter tokens so memory does not grow with sequence
+    # length.
     def _heavy_hitter_pruning(self, k, v, attn_weights, hh_k):
         # k, v: (s, b * n_head, head_dim)
         # attn_weights: (b * n_head, s, s)
@@ -71,13 +99,21 @@ class SelfAttention(nn.Module):
         """Input shape: Batch x Time x Channel"""
 
         bsz, tgt_len, _ = hidden_states.size()
+        # NOTE vs selfattention.py: that file tracks `self.src_s` to know
+        # where to write the new token into a pre-allocated cache. H2O does
+        # not need it because the cache is fixed-size (hh_k + 1) and the
+        # write slot is determined by the eviction rule below.
 
         # get query proj
         query_states = self.q_proj(hidden_states) * self.scaling
-        
+
         # get key/value proj
         if self.past_key_value is not None:
-            # reuse k, v, self_attention
+            # DECODE path. selfattention.py writes the new K/V into the next
+            # sequential slot; H2O always writes into the *last* slot (index
+            # -1), which is the placeholder zero-row appended after pruning.
+            # The H2O block at the bottom of forward() then decides which
+            # cached row this new entry should permanently replace.
             k = self._shape(self.k_proj(hidden_states), -1, bsz).squeeze()
             v = self._shape(self.v_proj(hidden_states), -1, bsz).squeeze()
             key_states = self.past_key_value[0]
@@ -85,7 +121,11 @@ class SelfAttention(nn.Module):
             value_states = self.past_key_value[1]
             value_states[:, :, -1] = v
         else:
-            # self_attention
+            # PREFILL path. selfattention.py allocates a (2, bsz, num_heads,
+            # 2048, head_dim) buffer and copies the prompt K/V into it here.
+            # H2O does NOT allocate the cache yet — it waits until after
+            # softmax so it can use the prefill attention scores to choose
+            # heavy-hitters before storing anything.
             key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
             value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
 
@@ -103,6 +143,11 @@ class SelfAttention(nn.Module):
         attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
 
         # masking
+        # DIFF vs selfattention.py: that file detects prefill via
+        #   `attn_weights.shape[1] > 1` (multi-token query). H2O uses its own
+        # step counter `self.i` because after prefill the cache is shrunk to
+        # `hh_k` tokens — the shape-based check would still see multi-row
+        # attn_weights occasionally and misfire.
         if self.i == 0: # prefill
             mask = torch.triu(torch.ones(attn_weights.shape).to('cuda'), diagonal=1) * -10000
             attn_weights = attn_weights + mask
@@ -122,7 +167,15 @@ class SelfAttention(nn.Module):
 
 
         ##### h2o ####
+        # ENTIRE BLOCK IS NEW vs selfattention.py.
+        # selfattention.py simply returns here — it keeps every cached token.
+        # H2O instead manages the cache: (a) prune to heavy-hitters right
+        # after prefill, (b) evict-and-replace on each decode step.
         if self.acc is None:
+            # First call (right after prefill). Compute how many heavy-hitter
+            # tokens to retain and call _heavy_hitter_pruning to shrink the
+            # cache to that size. A single zero-padded slot is appended so
+            # the next decode step has somewhere to write the new K/V.
             self.hh = int(attn_weights.shape[-1] * self.ratio)
             key_states, value_states, self.acc = self._heavy_hitter_pruning(key_states.permute(1,0,2), value_states.permute(1,0,2), attn_weights, self.hh)
             key_states = key_states.permute(1, 0, 2)
@@ -131,6 +184,16 @@ class SelfAttention(nn.Module):
                               torch.cat((value_states.reshape(bsz, self.num_heads, value_states.shape[-2], value_states.shape[-1]), torch.zeros(bsz, self.num_heads, 1, key_states.shape[-1]).to('cuda').to(torch.float16)), dim = -2))
 
         else:
+            # Subsequent decode calls. selfattention.py would append the new
+            # K/V at the next free slot, growing the cache unboundedly. H2O
+            # instead keeps the cache size fixed:
+            #   1. Add this step's attention scores into `acc` (running
+            #      importance score per cached token).
+            #   2. Find the token with the smallest cumulative score —
+            #      that is the least-important entry and the eviction victim.
+            #   3. Overwrite the victim's K/V row and accumulator entry with
+            #      the values from the last (newly added) row, then drop the
+            #      now-redundant last row.
             temp_attn = attn_weights.squeeze(1).transpose(0, 1)
             self.acc = torch.cat((self.acc, torch.zeros(1, bsz * self.num_heads).to('cuda')), dim=0)
             self.acc = self.acc + temp_attn
@@ -149,6 +212,8 @@ class SelfAttention(nn.Module):
             #value_states = value_states[:, :-1]
             self.past_key_value = (key_states.reshape(bsz, self.num_heads, key_states.shape[-2], key_states.shape[-1]),
                               value_states.reshape(bsz, self.num_heads, value_states.shape[-2], value_states.shape[-1]))
-            
+
+        # NEW vs selfattention.py: step counter advance, used by the prefill
+        # detection at the top of the next forward() call.
         self.i += 1
         return attn_output

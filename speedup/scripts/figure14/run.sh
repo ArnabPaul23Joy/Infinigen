@@ -3,34 +3,34 @@
 # batch=20, prompt=1920, gen=128). UVM (Unified Virtual Memory) lets the KV
 # cache exceed GPU VRAM by transparently paging between VRAM and CPU DRAM.
 
-UVM_PATH=$PWD/../../uvm
-# LD_LIBRARY_PATH lets Python find allocate.so (the custom CUDA allocator)
-# at runtime when transformer.py calls torch.cuda.memory.CUDAPluggableAllocator
-export LD_LIBRARY_PATH=$PWD:$LD_LIBRARY_PATH
+# UVM_PATH=$PWD/../../uvm
+# # LD_LIBRARY_PATH lets Python find allocate.so (the custom CUDA allocator)
+# # at runtime when transformer.py calls torch.cuda.memory.CUDAPluggableAllocator
+# export LD_LIBRARY_PATH=$PWD:$LD_LIBRARY_PATH
 
-for SCHEME in "uvm" "uvm_h2o"
-do
-  # Compile the custom CUDA allocator that replaces cudaMalloc with
-  # cudaMallocManaged, giving all tensors a unified CPU+GPU address space.
-  # Must be recompiled each scheme run because the .so is deleted afterwards.
-  g++ $UVM_PATH/allocate.cpp -o allocate.so --shared -fPIC -I$CUDA_HOME/include
+# for SCHEME in "uvm" "uvm_h2o"
+# do
+#   # Compile the custom CUDA allocator that replaces cudaMalloc with
+#   # cudaMallocManaged, giving all tensors a unified CPU+GPU address space.
+#   # Must be recompiled each scheme run because the .so is deleted afterwards.
+#   g++ $UVM_PATH/allocate.cpp -o allocate.so --shared -fPIC -I$CUDA_HOME/include
 
-  # Model config matching OPT-13B: embed_dim=5120, 40 heads, 40 layers.
-  # do_layer_norm_before = OPT's pre-norm style (used in 125M, 1.7B...175B).
-  CMD="--embed_dim 5120 --ffn_dim 20480 --enable_bias --n_head 40 --do_layer_norm_before --n_layer 40 --bsz 20 --prompt_len 1920 --gen_len 128 --runs 1"
+#   # Model config matching OPT-13B: embed_dim=5120, 40 heads, 40 layers.
+#   # do_layer_norm_before = OPT's pre-norm style (used in 125M, 1.7B...175B).
+#   CMD="--embed_dim 5120 --ffn_dim 20480 --enable_bias --n_head 40 --do_layer_norm_before --n_layer 40 --bsz 20 --prompt_len 1920 --gen_len 128 --runs 1"
 
-  if [ "$SCHEME" = "uvm_h2o" ]
-  then
-    # H2O (Heavy Hitter Oracle): after prefill, prune the KV cache to keep only
-    # the top 20% of tokens by accumulated attention score. This bounds the UVM
-    # working set to a fixed size regardless of sequence length.
-    CMD=$CMD" --is_h2o --h2o_ratio 0.2"
-  fi
+#   if [ "$SCHEME" = "uvm_h2o" ]
+#   then
+#     # H2O (Heavy Hitter Oracle): after prefill, prune the KV cache to keep only
+#     # the top 20% of tokens by accumulated attention score. This bounds the UVM
+#     # working set to a fixed size regardless of sequence length.
+#     CMD=$CMD" --is_h2o --h2o_ratio 0.2"
+#   fi
 
-  python $UVM_PATH/transformer.py $CMD
-  # Remove the shared library after each run to keep the directory clean
-  rm allocate.so
-done
+#   python $UVM_PATH/transformer.py $CMD
+#   # Remove the shared library after each run to keep the directory clean
+#   rm allocate.so
+# done
 
 # ─── SECTION 2: FLEXGEN PATH ─────────────────────────────────────────────────
 # Tests four FlexGen-based schemes. FlexGen explicitly offloads weights and KV
@@ -40,7 +40,8 @@ done
 
 FLEXGEN_PATH=$PWD/../../flexgen
 
-for SCHEME in "original" "int4" "h2o" "infinigen"
+# for SCHEME in "original" "int4" "h2o" "infinigen"
+for SCHEME in "infinigen"
 do
   # flexgen/flexgen/flex_opt.py is the active entry point used by
   # "python -m flexgen.flex_opt". Swapping the symlink changes which algorithm
@@ -66,7 +67,7 @@ do
   #   activations: 100% GPU,   0% CPU,   0% disk
   # So weights stay on GPU but the KV cache is offloaded to CPU RAM.
   # This is the key offloading scenario FlexGen is designed for.
-  CMD="--model huggingface/opt-13b --percent 100 0 0 100 100 0 --overlap false --gpu-batch-size 20 --num-gpu-batches 1 --prompt-len 1920 --gen-len 128 --warmup-input-path pg19_firstbook.txt --test-input-path pg19_firstbook.txt"
+  CMD="--model huggingface/opt-13b --percent 55 45 0 100 55 45 --overlap false --gpu-batch-size 20 --num-gpu-batches 1 --prompt-len 1920 --gen-len 128 --warmup-input-path pg19_firstbook.txt --test-input-path pg19_firstbook.txt"
 
   if [ "$SCHEME" = "int4" ]
   then
