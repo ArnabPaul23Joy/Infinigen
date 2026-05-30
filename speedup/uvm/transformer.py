@@ -68,6 +68,25 @@ prompt_len = args.prompt_len
 gen_len = args.gen_len
 ##################
 
+# Swap PyTorch's default GPU allocator for one backed by CUDA Unified Memory.
+#
+# Why: this script is the UVM offloading *baseline* InfiniGen is compared
+# against. The model + KV cache do not fit in VRAM. Instead of explicit
+# CPU<->GPU copies, we let CUDA's managed-memory subsystem migrate pages
+# on demand. For that to happen, every tensor PyTorch allocates must come
+# from cudaMallocManaged() rather than the default cudaMalloc().
+#
+# allocate.so is a tiny shared library compiled from allocate.cpp; it
+# exports two C symbols (uvm_malloc / uvm_free) that wrap
+# cudaMallocManaged() / cudaFree() and match the C-ABI signature(= C Application Binary Interface. It is the low-level contract that defines, at the binary level, how a function compiled in one language/compiler can be called by code compiled in another. "C-ABI signature" means a function declaration that follows that contract.)
+# CUDAPluggableAllocator expects. A pure-Python shim is not possible
+# because PyTorch invokes the allocator from CUDA stream callbacks where
+# the GIL is not held — only raw C function pointers loaded via dlopen
+# can be used.
+#
+# This swap must happen *before* any CUDA tensor is created; once
+# change_current_allocator() takes effect, all subsequent allocations
+# (weights, activations, KV cache) land in unified memory.
 new_alloc = torch.cuda.memory.CUDAPluggableAllocator(
         'allocate.so', 'uvm_malloc', 'uvm_free')
 torch.cuda.memory.change_current_allocator(new_alloc)
