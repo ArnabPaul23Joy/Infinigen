@@ -49,7 +49,7 @@ INPUT_PATH="$SCRIPT_DIR/pg19_firstbook.txt"
 
 # ─── FlexGen path: swap in the InfiniGen implementation via symlink ──────────
 # Only "infinigen" by default; add "original" "int4" "h2o" to also run baselines.
-for SCHEME in "infinigen"
+for SCHEME in "original" "int4" "h2o" "infinigen"
 do
   # -f so it doesn't error when the symlink is missing (fresh checkout / re-run).
   rm -f "$FLEXGEN_PATH/flexgen/flex_opt.py"
