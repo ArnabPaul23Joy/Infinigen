@@ -572,15 +572,54 @@ class SelfAttention:
             p_w_q = partial_weight_read_buf.val
 
         if i == 0:  # prefill
+            # Copy the attention mask to the GPU device where compute runs.
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
+
+            # Run full multi-head attention over the prompt tokens.
+            # mha() returns:
+            #   h              — updated hidden states after attention + MLP residual
+            #   new_k_cache    — K vectors for all prompt tokens, shape (s, b*n_head, head_dim)
+            #   new_v_cache    — V vectors for all prompt tokens, same shape
+            #   w_q, w_k       — possibly skewed weights (only changed during warmup)
+            #   self.partial_index — per-head top-k column indices that concentrate
+            #                        attention-score energy (shape: b, n_head, d');
+            #                        None during warmup because skewing hasn't run yet.
             h, new_k_cache, new_v_cache, w_q, w_k, self.partial_index = self.compute.mha(h, mask, w_q, b_q,
                 w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head, donate,
                 self.policy.compress_cache, self.policy.comp_cache_config, warmup, self.partial_weight_ratio)
+
+            # Hand the full KV cache to store_cache(), which will write it back
+            # to cache_home (CPU DRAM) asynchronously on store_cache_stream.
             cache_write_buf.store((new_k_cache, new_v_cache))
+
             if (prev_partial_cache_read_buf is not None) and (not warmup):
+                # InfiniGen speculation setup: the PREVIOUS attention layer (layer j-1)
+                # needs a "partial KV cache" and "partial W_Q" ready before its first
+                # decode step so mha_gen can run speculation without stalling.
+                # We build them now, at the end of the prefill, using this layer's
+                # partial_index (same index is reused across layers after skewing).
+                #
+                # set_partial_cache: slices new_k_cache to keep only the top-k
+                # columns per head — shape shrinks from (s, b*h, head_dim) to
+                # (s, b*h, d') where d' = head_dim * partial_weight_ratio.
                 prev_partial_cache_read_buf.store(set_partial_cache(new_k_cache.data, self.partial_index, n_head, head_dim))
+                # set_partial_weight: slices the skewed W_Q rows corresponding to
+                # the same top-k columns — shape shrinks from (D, D) to (D', D)
+                # where D' = n_head * d'. mha_gen multiplies h by this small matrix
+                # to get a cheap partial-Q for speculation, avoiding the full QK^T.
                 prev_partial_weight_read_buf.store(set_partial_weight(w_q.data, self.partial_index, n_head, head_dim))
+
             if warmup:
+                # mha() just ran the offline SVD skewing pass (Section 4.1):
+                # it modified w_q.data and w_k.data in-place so that the columns
+                # with the largest joint Q/K singular values come first. These
+                # skewed weights must replace the originals in weight_home so that
+                # every subsequent real-prompt prefill and decode step uses them.
+                # smart_copy(device) copies to the tensor's original device
+                # (CPU DRAM in the default offloading config) and returns
+                # (TorchTensor, donated_flag); [0] extracts just the tensor.
+                # weight_home.val[0] = W_Q, weight_home.val[2] = W_K
+                # (indices match the order weights were packed into weight_home).
                 weight_home.val[0] = w_q.smart_copy(weight_home.val[0].device)[0]
                 weight_home.val[2] = w_k.smart_copy(weight_home.val[2].device)[0]
         else:  # decoding
@@ -867,7 +906,16 @@ class OptLM:
             if i == self.execute_gen_len:
                 return
 
-        # Load from weight_home to weight_read_buf
+        # Load from weight_home to weight_read_buf.
+        # overlap=True: the caller (generation_loop_overlap_*) has already
+        # issued compute_layer(i, j-1, k) on the default stream for the
+        # PREVIOUS layer. By issuing this copy on load_weight_stream (a
+        # separate CUDA stream), the PCIe transfer of layer j's weights
+        # runs concurrently with that GPU compute — the GPU's copy engine
+        # and its shader cores operate in parallel.
+        # overlap=False: used in generation_loop_normal / debug paths where
+        # ops are intentionally serialised for correctness clarity; no
+        # stream switch needed because everything runs on the default stream.
         if overlap:
             with torch.cuda.stream(self.load_weight_stream):
                 self.layers[j].load_weight(self.weight_home[j], self.weight_read_buf[j], k)
@@ -1044,7 +1092,18 @@ class OptLM:
                 self.cache_write_buf[j][k], i, k)
 
     def sync(self):
+        # Wait for all background disk-copy threads to finish.
+        # TorchDisk uses a Python thread pool + queue to move tensors between
+        # disk and CPU asynchronously. synchronize() calls copy_queue.join(),
+        # which blocks until every item placed on that queue has been processed
+        # (i.e. every pending disk read/write has completed).
         self.env.disk.synchronize()
+        # Wait for all CUDA operations on ALL streams to complete.
+        # torch.cuda.synchronize() is a global barrier — it blocks the CPU
+        # until every kernel and memcpy on every CUDA stream (load_weight_stream,
+        # load_cache_stream, store_cache_stream, prefetch_cache_stream, etc.)
+        # has finished. After this returns, it is safe to read any GPU tensor
+        # that was being written asynchronously.
         torch.cuda.synchronize()
 
     def init_all_weights(self):
@@ -1138,10 +1197,20 @@ class OptLM:
         self.hidden = array_3d(gen_len, num_layers, num_gpu_batches, ValueHolder)
 
         # Init cache
+        # Propagate the Task (prompt_len, gen_len, etc.) down to every layer so
+        # each layer knows how large to make its buffers.
         self.set_task(task)
+        # Allocate KV-cache storage for every (layer, gpu-batch) pair.
+        # cache_home[j][k] is the cold storage location (CPU RAM or disk) for
+        # layer j, gpu-batch k; it stays allocated for the full generation loop.
         for j in range(num_layers):
             for k in range(num_gpu_batches):
                 self.init_cache(j, k)
+        # When the policy runs attention math on the CPU (cpu_cache_compute=True),
+        # the attention scores are computed in fp32 on CPU rather than on GPU.
+        # Pre-allocate a reusable fp32 scratch buffer sized for
+        # (prompt_len + gen_len, batch * n_head, head_dim) so no allocation
+        # happens inside the hot generation loop.
         if self.policy.cpu_cache_compute:
             self.env.cpu.init_attention_compute_workspace(self.config, self.task, self.policy)
 
