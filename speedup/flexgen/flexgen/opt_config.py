@@ -239,30 +239,47 @@ def download_opt_weights(model_name, path):
           f"If it seems to get stuck, you can monitor the progress by "
           f"checking the memory usage of this process.")
 
+    # Both OPT and Galactica are Facebook models; prepend the org name so
+    # snapshot_download gets the full HuggingFace repo id (e.g. "facebook/opt-13b").
     if "opt" in model_name:
         hf_model_name = "facebook/" + model_name
     elif "galactica" in model_name:
         hf_model_name = "facebook/" + model_name
 
+    # Download only the weight shards (*.bin); skips tokenizer files, configs, etc.
+    # Returns the local cache directory where the files now live.
     folder = snapshot_download(hf_model_name, allow_patterns="*.bin")
     bin_files = glob.glob(os.path.join(folder, "*.bin"))
 
+    # Strip any org prefix the caller passed (e.g. "huggingface/opt-13b" → "opt-13b")
+    # so the output directory name is clean.
     if "/" in model_name:
         model_name = model_name.split("/")[1].lower()
+    # Append model name + "-np" suffix to the base path, e.g. "~/opt_weights/opt-13b-np"
     path = os.path.join(path, f"{model_name}-np")
+    # Expand "~" to the real home directory, then resolve to an absolute path
     path = os.path.abspath(os.path.expanduser(path))
+    # Create the directory (and any missing parents); do nothing if it already exists
     os.makedirs(path, exist_ok=True)
 
     for bin_file in tqdm(bin_files, desc="Convert format"):
+        # Each .bin shard is a dict of {parameter_name: tensor}.
         state = torch.load(bin_file)
         for name, param in tqdm(state.items(), leave=False):
+            # HuggingFace wraps everything under "model." — strip it so paths
+            # match what FlexGen expects (e.g. "decoder.layers.0.self_attn...").
             name = name.replace("model.", "")
+            # HuggingFace calls it "final_layer_norm"; FlexGen calls it "layer_norm".
             name = name.replace("decoder.final_layer_norm", "decoder.layer_norm")
             param_path = os.path.join(path, name)
             with open(param_path, "wb") as f:
+                # Move tensor to CPU (in case it was on GPU), detach from autograd,
+                # and save as a raw numpy array — one file per parameter.
                 np.save(f, param.cpu().detach().numpy())
 
-            # shared embedding
+            # OPT ties the input embedding and the output (LM head) projection —
+            # they share the same weight matrix. Copy the file under both names
+            # so FlexGen can load each independently without knowing they're tied.
             if "decoder.embed_tokens.weight" in name:
                 shutil.copy(param_path, param_path.replace(
                     "decoder.embed_tokens.weight", "lm_head.weight"))
