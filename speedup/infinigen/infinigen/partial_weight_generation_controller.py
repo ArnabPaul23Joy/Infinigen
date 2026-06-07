@@ -100,9 +100,37 @@ def set_partial_weight(w_q, partial_index, n_head, head_dim):
         partial_weight: Partial query weight (D', D)
     """
 
+    # partial_index:  (b, n_head, d')  — top-k column indices per head, per batch.
+    #                 Values are LOCAL indices within each head's [0, head_dim) slice.
+    # partial_index[0]: (n_head, d')  — take batch 0; all batches share the same
+    #                 index pattern (the same columns matter for every sequence in
+    #                 the batch) so only one batch's indices are needed here.
+    #
+    # torch.arange(n_head)[:, None]:  (n_head, 1)  — [0, 1, 2, ..., n_head-1],
+    #                 column-vector so it broadcasts over the d' axis.
+    # * head_dim:     converts head indices to their starting GLOBAL row offsets
+    #                 in the flat weight matrix (head h starts at row h*head_dim).
+    #
+    # Adding the two gives GLOBAL row indices into w_q:
+    #   partial_index[0] + arange * head_dim  →  shape (n_head, d')
+    #   e.g. head=2, local col=3, head_dim=64 → global row = 2*64 + 3 = 131
+    #
+    # w_q.view(-1, w_q.shape[-1]):  (D, D+1) flattened to (D, D+1) — W_Q was
+    #                 stored as (D, D) or (D, D+1) after bias absorption;
+    #                 view(-1, ...) makes the first axis a flat row index so
+    #                 F.embedding can index into it directly.
+    #
+    # F.embedding(index, table): looks up rows of `table` at positions given by
+    #                 `index`. Here it selects the d' most important rows per head
+    #                 from the full W_Q — one row = one output dimension of the
+    #                 Q projection.  Result shape: (n_head, d', D+1).
     partial_weight = F.embedding(
         partial_index[0]
         + torch.arange(n_head)[:, None].to(partial_index.device) * head_dim,
         w_q.view(-1, w_q.shape[-1]),
     )
+    # Flatten (n_head, d', D+1) → (n_head * d', D+1) = (D', D+1).
+    # This is the "small W_Q" used during decode speculation: multiplying the
+    # new token's hidden state (D+1,) by this (D', D+1) matrix gives a partial-Q
+    # of size D' instead of D — cheap enough to run before the full attention.
     return partial_weight.view(-1, w_q.shape[-1])

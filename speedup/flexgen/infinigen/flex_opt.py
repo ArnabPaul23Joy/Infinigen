@@ -608,6 +608,7 @@ class SelfAttention:
                 # where D' = n_head * d'. mha_gen multiplies h by this small matrix
                 # to get a cheap partial-Q for speculation, avoiding the full QK^T.
                 prev_partial_weight_read_buf.store(set_partial_weight(w_q.data, self.partial_index, n_head, head_dim))
+
             if warmup:
                 # mha() just ran the offline SVD skewing pass (Section 4.1):
                 # it modified w_q.data and w_k.data in-place so that the columns
@@ -1091,7 +1092,18 @@ class OptLM:
                 self.cache_write_buf[j][k], i, k)
 
     def sync(self):
+        # Wait for all background disk-copy threads to finish.
+        # TorchDisk uses a Python thread pool + queue to move tensors between
+        # disk and CPU asynchronously. synchronize() calls copy_queue.join(),
+        # which blocks until every item placed on that queue has been processed
+        # (i.e. every pending disk read/write has completed).
         self.env.disk.synchronize()
+        # Wait for all CUDA operations on ALL streams to complete.
+        # torch.cuda.synchronize() is a global barrier — it blocks the CPU
+        # until every kernel and memcpy on every CUDA stream (load_weight_stream,
+        # load_cache_stream, store_cache_stream, prefetch_cache_stream, etc.)
+        # has finished. After this returns, it is safe to read any GPU tensor
+        # that was being written asynchronously.
         torch.cuda.synchronize()
 
     def init_all_weights(self):

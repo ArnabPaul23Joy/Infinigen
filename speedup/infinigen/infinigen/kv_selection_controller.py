@@ -55,7 +55,24 @@ def speculate_attention(hidden, p_w_q, p_k_c, n_head, alpha, max_num_kv):
     count = torch.where(
         p_attn > thr_, torch.ones_like(p_attn), torch.zeros_like(p_attn)
     )
+    # count: (b*n_head, 1, n) — 1.0 where the partial attention score exceeds
+    # the per-head threshold (max - alpha), 0.0 elsewhere.
+    # torch.sum(count, dim=-1): (b*n_head, 1) — how many tokens are "critical"
+    # for each head in each sequence.
+    # torch.mean(...).item(): scalar — average number of critical tokens across
+    # all heads and batch items. This is the adaptive k: rather than always
+    # fetching a fixed number of KV tokens, we fetch as many as the partial
+    # attention scores say are above the threshold on average.
     mean = torch.mean(torch.sum(count, dim=-1)).item()
+
+    # p_attn shape is (b*n_head, 1, n). Permute to (n, 1, b*n_head) so that
+    # torch.topk operates along dim=0 (the token axis), selecting the top-k
+    # token positions independently for each head and batch entry.
+    # min(int(mean), max_num_kv) caps k so we never fetch more than max_num_kv
+    # tokens even if the threshold gives a large mean — a memory safety bound.
+    # [1] takes the indices (not the values) from topk, giving the token
+    # positions of the k most critical KV entries.
+    # prefetch_idx shape: (k, 1, b*n_head) — the token indices to prefetch.
     prefetch_idx = torch.topk(
         p_attn.permute(2, 1, 0), min(int(mean), max_num_kv), dim=0
     )[1]
